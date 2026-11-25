@@ -3,6 +3,8 @@ from datetime import date, datetime, timedelta
 import pandas as pd
 import streamlit as st
 
+from ia_autonoma import executar_assistente_granja
+
 DB_PATH = "granja_vieira.db"
 
 
@@ -229,7 +231,7 @@ def obter_dados_sistema():
     for prod, info in produtos.items():
         custo_med = (info["Valor Comprado (R$)"] / info["Qtd. Comprada"]) if info["Qtd. Comprada"] > 0 else 0.0
         cons_alim = consumo_por_produto.get(prod, 0.0)
-        cons_extra_racao = consumo_reg_direto if "ração" in prod.lower() or "racao" in prod.lower() else 0.0
+        cons_extra_racao = consumo_reg_direto if ("ração" in prod.lower() or "racao" in prod.lower()) else 0.0
         qtd_cons = cons_alim + cons_extra_racao
         saldo = max(info["Qtd. Comprada"] - qtd_cons, 0.0)
         valor_est = saldo * custo_med
@@ -344,7 +346,13 @@ def montar_resumo_e_custos(lotes_df, estoque_df, alim_df, reg_df, pesagens_df, s
         for _, c in custos_df.iterrows():
             t_custo = str(c["tipo_custo"] or "Variável")
             val_c = float(c["valor"] or 0.0)
-            lid_c = None if c["lote_id"] is None or pd.isna(c["lote_id"]) or str(c["lote_id"]).strip() in ("", "None", "Geral (Ratear)") else str(c["lote_id"]).strip()
+            lid_c = (
+                None
+                if c["lote_id"] is None
+                or pd.isna(c["lote_id"])
+                or str(c["lote_id"]).strip() in ("", "None", "Geral (Ratear)")
+                else str(c["lote_id"]).strip()
+            )
             base_rateio = str(c["rateio_base"] or "Por Ave Viva")
 
             if t_custo == "Fixo":
@@ -492,7 +500,7 @@ st.set_page_config(page_title="Granja Vieira", page_icon="🐔", layout="wide")
 init_db()
 
 st.title("🐔 Granja Vieira — Gestão Avícola Completa")
-st.caption("Sistema completo: Registro Rápido, Lotes, Alimentação, Estoque, Pesagens, Sanidade, Custos, Vendas, Fluxo de Caixa e Painel IA")
+st.caption("Sistema completo: Registro Rápido, Lotes, Alimentação, Estoque, Pesagens, Sanidade, Custos, Vendas, Fluxo de Caixa e Assistente IA")
 
 lotes_df, estoque_df, compras_df, alim_df, reg_df, pesagens_df, sanidade_df, custos_df, vendas_df = obter_dados_sistema()
 resumo_df, custos_lote_df = montar_resumo_e_custos(
@@ -505,6 +513,7 @@ total_mortes = int(resumo_df["Mortes Acum."].sum()) if not resumo_df.empty else 
 total_racao = float(resumo_df["Consumo Acum. (kg)"].sum()) if not resumo_df.empty else 0.0
 total_custo_geral = float(custos_lote_df["Custo Total (R$)"].sum()) if not custos_lote_df.empty else 0.0
 lotes_ativos = int((resumo_df["Situação"] == "Ativo").sum()) if not resumo_df.empty else 0
+lista_lotes = resumo_df["Lote"].tolist() if not resumo_df.empty else ["LOTE 01", "LOTE 02", "LOTE 03"]
 
 abas = st.tabs([
     "⚡ Registro Rápido",
@@ -516,9 +525,10 @@ abas = st.tabs([
     "💰 Custos e Preço",
     "🤝 Vendas",
     "💵 Fluxo de Caixa",
-    "📊 Painel e Relatório IA",
+    "🤖 Assistente IA",
 ])
 
+# 0: REGISTRO RÁPIDO
 with abas[0]:
     st.subheader("Registro Diário Rápido")
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -591,13 +601,14 @@ with abas[0]:
         elif not erros:
             st.info("Nenhuma alteração preenchida para salvar.")
 
+# 1: LOTES
 with abas[1]:
     st.subheader("Controle de Lotes")
     st.dataframe(resumo_df, width="stretch", hide_index=True)
 
     st.divider()
     st.markdown("**Editar dados do lote (data de alojamento, tipo de ave, origem, custo ou situação):**")
-    lote_escolhido = st.selectbox("Selecione o lote", resumo_df["Lote"].tolist())
+    lote_escolhido = st.selectbox("Selecione o lote", lista_lotes)
 
     conn = get_conn()
     lote_row = conn.execute("SELECT * FROM lotes WHERE id = ?", (lote_escolhido,)).fetchone()
@@ -653,6 +664,7 @@ with abas[1]:
             st.success(f"✅ {lote_escolhido} atualizado!")
             st.rerun()
 
+# 2: ALIMENTAÇÃO
 with abas[2]:
     st.subheader("Alimentação por Lote (Consumo e Sobras)")
     st.caption("Separa quantidade fornecida de sobra medida. Quando não há sobra medida, o consumo é marcado como estimado pela quantidade fornecida.")
@@ -662,7 +674,7 @@ with abas[2]:
 
     col1, col2, col3, col4 = st.columns(4)
     data_alim = col1.date_input("Data da alimentação", value=date.today(), key="data_alim")
-    lote_alim = col2.selectbox("Lote", resumo_df["Lote"].tolist(), key="lote_alim")
+    lote_alim = col2.selectbox("Lote", lista_lotes, key="lote_alim")
     fase_alim = col3.selectbox("Fase alimentar", ["Não informada", "Inicial", "Crescimento", "Terminação", "Milho / Verde / Extra"], key="fase_alim")
     sel_prod = col4.selectbox("Item do estoque", opcoes_prod, key="sel_prod")
 
@@ -719,71 +731,52 @@ with abas[2]:
             """, (data_alim.isoformat(), lote_alim, float(consumo_liq), nota_reg))
             conn.commit()
             conn.close()
-            st.success(f"✅ Alimentação registrada para {lote_alim}: consumo de {consumo_liq:.2f} kg (custo estimado: R$ {custo_est:.2f}).")
+            st.success(f"✅ Alimentação registrada para {lote_alim}: consumo líquido de {consumo_liq:.2f} kg.")
             st.rerun()
 
     st.divider()
-    st.markdown("**Lançamentos de alimentação registrados:**")
-    if alim_df.empty:
-        st.info("Nenhuma alimentação lançada ainda.")
-    else:
-        exibir_alim = alim_df.copy()
-        exibir_alim["Tipo de Consumo"] = exibir_alim["sobra_medida"].apply(
-            lambda x: "Líquido (com sobra medida)" if int(x) == 1 else "Estimado (pelo fornecido)"
-        )
-        st.dataframe(
-            exibir_alim[["data_registro", "lote_id", "produto_estoque", "fase_alimentar", "qtd_fornecida_kg", "qtd_sobra_kg", "consumo_liquido_kg", "Tipo de Consumo", "custo_estimado", "observacoes"]]
-            .sort_values(by=["data_registro", "id"], ascending=False),
-            width="stretch",
-            hide_index=True,
-        )
+    st.markdown("**Histórico de alimentação**")
+    st.dataframe(alim_df, width="stretch", hide_index=True)
 
+# 3: COMPRAS E ESTOQUE
 with abas[3]:
-    st.subheader("Compras e Estoque de Insumos")
-    st.caption("Compras atualizam o estoque e o custo médio. O custo de produção do lote é calculado pelo consumo efetivo, evitando dupla contagem.")
-
-    if not estoque_df.empty:
-        alertas = estoque_df[estoque_df["Alerta"] != "✅ OK"]
-        for _, al in alertas.iterrows():
-            st.warning(f"⚠️ **Estoque baixo:** {al['Produto']} com saldo de {al['Saldo Atual']} {al['Unidade']} (mínimo: {al['Estoque Mínimo']}).")
-        st.dataframe(estoque_df, width="stretch", hide_index=True)
-    else:
-        st.info("Cadastre sua primeira compra abaixo para iniciar o controle de estoque.")
+    st.subheader("Compras e Controle de Estoque")
+    st.dataframe(estoque_df, width="stretch", hide_index=True)
 
     st.divider()
-    st.markdown("**Registrar nova compra / entrada no estoque:**")
-    c_a, c_b, c_c, c_d = st.columns(4)
-    data_comp = c_a.date_input("Data da compra", value=date.today(), key="data_comp")
-    prod_comp = c_b.text_input("Produto / Insumo", placeholder="Ex.: Ração Inicial", key="prod_comp")
-    cat_comp = c_c.selectbox("Categoria", ["Ração", "Milho / Ingrediente", "Sanidade / Vacina", "Pintinhos", "Manejo / Cama", "Outros"], key="cat_comp")
-    forn_comp = c_d.text_input("Fornecedor", placeholder="Opcional", key="forn_comp")
+    st.markdown("**Registrar nova compra de insumo / ração / medicamento**")
+    c1, c2, c3, c4 = st.columns(4)
+    data_comp = c1.date_input("Data da compra", value=date.today(), key="data_comp")
+    prod_comp = c2.text_input("Produto", placeholder="Ex.: Ração Inicial", key="prod_comp")
+    cat_comp = c3.selectbox("Categoria", ["Ração", "Medicamento", "Insumo", "Embalagem", "Outros"], key="cat_comp")
+    forn_comp = c4.text_input("Fornecedor", placeholder="Opcional", key="forn_comp")
 
-    c_e, c_f, c_g, c_h = st.columns(4)
-    qtd_comp_txt = c_e.text_input("Quantidade comprada", placeholder="Ex.: 100", key="qtd_comp")
-    unid_comp = c_f.selectbox("Unidade", ["kg", "sc", "un", "L"], key="unid_comp")
-    preco_unit_txt = c_g.text_input("Preço unitário (R$)", placeholder="Ex.: 2.80", key="preco_unit_comp")
-    min_est_txt = c_h.text_input("Alerta estoque mínimo", value="20", key="min_est_comp")
+    c5, c6, c7, c8 = st.columns(4)
+    qtd_comp_txt = c5.text_input("Quantidade", placeholder="Ex.: 50", key="qtd_comp_txt")
+    un_comp = c6.text_input("Unidade", value="kg", key="un_comp")
+    pu_comp_txt = c7.text_input("Preço unitário (R$)", placeholder="Ex.: 2.60", key="pu_comp_txt")
+    est_min_txt = c8.text_input("Estoque mínimo", value="20", key="est_min_txt")
 
-    c_i, c_j = st.columns(2)
-    lote_comp = c_i.selectbox("Lote relacionado (opcional)", ["Nenhum (Estoque Geral)"] + resumo_df["Lote"].tolist(), key="lote_comp")
-    obs_comp = c_j.text_input("Observações da compra", placeholder="Opcional", key="obs_comp")
+    c9, c10 = st.columns([1, 2])
+    lote_comp = c9.selectbox("Lote (opcional)", ["Geral"] + lista_lotes, key="lote_comp")
+    obs_comp = c10.text_input("Observações da compra", placeholder="Opcional", key="obs_comp")
 
-    if st.button("🛒 Salvar Compra no Estoque", type="primary"):
+    if st.button("📦 Salvar Compra no Estoque", type="primary"):
         try:
-            qtd_c = parse_numero_opcional(qtd_comp_txt)
-            preco_u = parse_numero_opcional(preco_unit_txt)
-            min_e = parse_numero_opcional(min_est_txt)
+            qtd_val = parse_numero_opcional(qtd_comp_txt)
+            pu_val = parse_numero_opcional(pu_comp_txt)
+            emin_val = parse_numero_opcional(est_min_txt) or 20.0
         except ValueError:
-            st.error("Quantidade, preço unitário ou estoque mínimo inválidos.")
-            qtd_c, preco_u, min_e = None, None, None
+            st.error("Quantidade ou preço unitário inválido.")
+            qtd_val, pu_val = None, None
 
         if not prod_comp.strip():
             st.error("Informe o nome do produto.")
-        elif qtd_c is None or qtd_c <= 0 or preco_u is None or preco_u < 0:
+        elif qtd_val is None or qtd_val <= 0 or pu_val is None or pu_val < 0:
             st.error("Informe quantidade maior que zero e preço unitário válido.")
         else:
-            val_tot = round(qtd_c * preco_u, 2)
-            lote_ref = None if lote_comp == "Nenhum (Estoque Geral)" else lote_comp
+            val_tot = round(qtd_val * pu_val, 2)
+            lid_salvar = None if lote_comp == "Geral" else lote_comp
             conn = get_conn()
             conn.execute("""
                 INSERT INTO compras_estoque
@@ -791,55 +784,48 @@ with abas[3]:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 data_comp.isoformat(), prod_comp.strip(), cat_comp, forn_comp.strip(),
-                float(qtd_c), unid_comp, float(preco_u), float(val_tot),
-                lote_ref, float(min_e if min_e is not None else 0.0), obs_comp.strip()
+                float(qtd_val), un_comp.strip() or "kg", float(pu_val), val_tot,
+                lid_salvar, float(emin_val), obs_comp.strip()
             ))
             conn.commit()
             conn.close()
-            st.success(f"✅ Compra de {qtd_c} {unid_comp} de {prod_comp.strip()} salva (Total: R$ {val_tot:.2f}).")
+            st.success(f"✅ Compra de {qtd_val} {un_comp} de {prod_comp.strip()} registrada (R$ {val_tot:.2f})!")
             st.rerun()
 
     st.divider()
-    st.markdown("**Histórico de compras:**")
-    if compras_df.empty:
-        st.info("Nenhuma compra registrada até o momento.")
-    else:
-        st.dataframe(compras_df.sort_values(by=["data_compra", "id"], ascending=False), width="stretch", hide_index=True)
+    st.markdown("**Histórico de compras**")
+    st.dataframe(compras_df, width="stretch", hide_index=True)
 
+# 4: PESAGENS
 with abas[4]:
-    st.subheader("Pesagens e Desempenho Zootécnico (Peso Médio, GPD e Conversão Alimentar)")
-    st.caption("Informe o número de aves pesadas e o peso total (em kg) da amostra/lote. O sistema calcula o peso médio, o ganho de peso diário (GPD) e a conversão alimentar (CA).")
-
+    st.subheader("Pesagens, GPD e Conversão Alimentar")
     p1, p2, p3, p4 = st.columns(4)
     data_pes = p1.date_input("Data da pesagem", value=date.today(), key="data_pes")
-    lote_pes = p2.selectbox("Lote", resumo_df["Lote"].tolist(), key="lote_pes")
-    aves_pes_qtd = p3.number_input("Aves pesadas (qtd.)", min_value=1, value=10, step=1, key="aves_pes_qtd")
-    peso_tot_txt = p4.text_input("Peso total pesado (kg)", placeholder="Ex.: 18.5", key="peso_tot_txt")
+    lote_pes = p2.selectbox("Lote", lista_lotes, key="lote_pes")
+    aves_pes_txt = p3.text_input("Aves pesadas", placeholder="Ex.: 20", key="aves_pes_txt")
+    peso_tot_txt = p4.text_input("Peso total da amostra (kg)", placeholder="Ex.: 36.0", key="peso_tot_txt")
+    obs_pes = st.text_input("Observações da pesagem", placeholder="Opcional", key="obs_pes")
 
-    obs_pes = st.text_input("Observações da pesagem", placeholder="Ex.: Pesagem semanal de amostra", key="obs_pes")
-
-    if st.button("⚖️ Salvar Pesagem", type="primary"):
+    if st.button("⚖️ Registrar Pesagem", type="primary"):
         try:
-            peso_tot = parse_numero_opcional(peso_tot_txt)
+            n_aves_p = int(float(aves_pes_txt.replace(",", "."))) if aves_pes_txt.strip() else 0
+            p_tot_p = parse_numero_opcional(peso_tot_txt)
         except ValueError:
-            st.error("Peso total inválido. Use números como 18.5.")
-            peso_tot = None
+            st.error("Valores de pesagem inválidos.")
+            n_aves_p, p_tot_p = 0, None
 
-        if peso_tot is None or peso_tot <= 0:
-            st.error("Informe um peso total maior que zero.")
+        if n_aves_p <= 0 or p_tot_p is None or p_tot_p <= 0:
+            st.error("Informe quantidade de aves pesadas e peso total maiores que zero.")
         else:
-            peso_med_kg = round(peso_tot / int(aves_pes_qtd), 4)
-            lote_info = resumo_df[resumo_df["Lote"] == lote_pes].iloc[0]
-            racao_acum_lote = float(lote_info["Consumo Acum. (kg)"])
-            aves_disp_lote = int(lote_info["Aves Disponíveis"])
+            peso_med_p = round(p_tot_p / n_aves_p, 4)
+            linha_lote = resumo_df[resumo_df["Lote"] == lote_pes].iloc[0]
+            racao_acum_p = float(linha_lote["Consumo Acum. (kg)"])
+            aves_vivas_p = int(linha_lote["Aves Disponíveis"])
+            lote_raw = lotes_df[lotes_df["id"] == lote_pes].iloc[0]
+            d_aloj_p = parse_data_segura(lote_raw["data_alojamento"])
 
-            conn = get_conn()
-            lote_db = conn.execute("SELECT data_alojamento FROM lotes WHERE id = ?", (lote_pes,)).fetchone()
-            conn.close()
-            d_aloj_obj = parse_data_segura(lote_db["data_alojamento"]) if lote_db else None
-
-            gpd_val, ca_val = calcular_metricas_pesagem(
-                lote_pes, data_pes, peso_med_kg, racao_acum_lote, aves_disp_lote, d_aloj_obj, pesagens_df
+            gpd_p, ca_p = calcular_metricas_pesagem(
+                lote_pes, data_pes, peso_med_p, racao_acum_p, aves_vivas_p, d_aloj_p, pesagens_df
             )
 
             conn = get_conn()
@@ -847,344 +833,229 @@ with abas[4]:
                 INSERT INTO pesagens
                 (data_pesagem, lote_id, aves_pesadas, peso_total_kg, peso_medio_kg, gpd_g_dia, conversao_alimentar, observacoes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                data_pes.isoformat(), lote_pes, int(aves_pes_qtd), float(peso_tot),
-                float(peso_med_kg), gpd_val, ca_val, obs_pes.strip()
-            ))
+            """, (data_pes.isoformat(), lote_pes, n_aves_p, float(p_tot_p), peso_med_p, gpd_p, ca_p, obs_pes.strip()))
             conn.commit()
             conn.close()
-            st.success(f"✅ Pesagem salva para {lote_pes}: Peso médio de {peso_med_kg:.3f} kg ({peso_med_kg*1000:.0f} g).")
+            st.success(f"✅ Pesagem registrada! Peso médio: {peso_med_p:.3f} kg.")
             st.rerun()
 
     st.divider()
-    st.markdown("**Histórico de pesagens:**")
-    if pesagens_df.empty:
-        st.info("Nenhuma pesagem registrada ainda.")
-    else:
-        exibir_pes = pesagens_df.copy()
-        exibir_pes["Peso Médio (g)"] = (exibir_pes["peso_medio_kg"] * 1000).round(0)
-        st.dataframe(
-            exibir_pes[["data_pesagem", "lote_id", "aves_pesadas", "peso_total_kg", "peso_medio_kg", "Peso Médio (g)", "gpd_g_dia", "conversao_alimentar", "observacoes"]]
-            .sort_values(by=["data_pesagem", "id"], ascending=False),
-            width="stretch",
-            hide_index=True,
-        )
+    st.dataframe(pesagens_df, width="stretch", hide_index=True)
 
+# 5: SANIDADE
 with abas[5]:
     st.subheader("Sanidade e Controle de Carência")
-    st.caption("Registre vacinas, medicamentos ou ocorrências. Quando houver dias de carência, o sistema calcula a data de liberação e alerta o lote.")
-
-    carencia_linhas = []
-    for lid in resumo_df["Lote"].tolist():
-        em_car, d_lib_str, status_txt = obter_carencia_lote(lid, sanidade_df)
-        carencia_linhas.append({
-            "Lote": lid,
-            "Status Sanitário": status_txt,
-            "Data de Liberação": d_lib_str,
-        })
-    st.dataframe(pd.DataFrame(carencia_linhas), width="stretch", hide_index=True)
-
-    st.divider()
-    st.markdown("**Registrar aplicação de vacina, medicamento ou ocorrência sanitária:**")
     s1, s2, s3, s4 = st.columns(4)
-    data_san = s1.date_input("Data da aplicação / ocorrência", value=date.today(), key="data_san")
-    lote_san = s2.selectbox("Lote", resumo_df["Lote"].tolist(), key="lote_san")
-    tipo_san = s3.selectbox("Tipo de evento", ["Vacina", "Medicamento / Antibiótico", "Suplemento / Vitamina", "Ocorrência / Sintoma"], key="tipo_san")
-    prod_san = s4.text_input("Produto / Vacina / Ocorrência", placeholder="Ex.: Newcastle / Enrofloxacino", key="prod_san")
+    data_san = s1.date_input("Data da aplicação", value=date.today(), key="data_san")
+    lote_san = s2.selectbox("Lote", lista_lotes, key="lote_san")
+    tipo_san = s3.selectbox("Tipo de evento", ["Vacina", "Vermifugação", "Antibiótico / Tratamento", "Vitamina / Manejo"], key="tipo_san")
+    prod_san = s4.text_input("Produto / tratamento", placeholder="Ex.: Newcastle / Enrofloxacino", key="prod_san")
 
-    s5, s6, s7, s8 = st.columns(4)
-    dose_san = s5.text_input("Dose / via / detalhe", placeholder="Ex.: 0,2 ml água", key="dose_san")
-    carencia_dias_val = s6.number_input("Carência (dias)", min_value=0, value=0, step=1, key="carencia_dias_val")
+    s5, s6, s7 = st.columns(3)
+    carencia_dias_txt = s5.text_input("Carência (dias)", value="0", key="carencia_dias_txt")
+    dose_san = s6.text_input("Dose / via / observação", placeholder="Opcional", key="dose_san")
     resp_san = s7.text_input("Responsável", placeholder="Opcional", key="resp_san")
-    obs_san = s8.text_input("Observações", placeholder="Opcional", key="obs_san")
 
-    data_lib_prevista = data_san + timedelta(days=int(carencia_dias_val))
-    st.info(f"📅 Data de liberação calculada para este lançamento: **{data_lib_prevista.isoformat()}** ({int(carencia_dias_val)} dia(s) de carência).")
+    if st.button("🩺 Registrar Evento Sanitário", type="primary"):
+        try:
+            dias_car = int(float(carencia_dias_txt.replace(",", "."))) if carencia_dias_txt.strip() else 0
+            if dias_car < 0:
+                dias_car = 0
+        except ValueError:
+            st.error("Dias de carência inválidos.")
+            dias_car = None
 
-    if st.button("🩺 Salvar Registro Sanitário", type="primary"):
         if not prod_san.strip():
-            st.error("Informe o nome do produto, vacina ou ocorrência.")
-        else:
+            st.error("Informe o produto ou tratamento aplicado.")
+        elif dias_car is not None:
+            data_lib = (data_san + timedelta(days=dias_car)).isoformat()
             conn = get_conn()
             conn.execute("""
                 INSERT INTO sanidade
                 (data_aplicacao, lote_id, tipo_evento, produto_tratamento, dose_observacao, carencia_dias, data_liberacao, responsavel, observacoes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                data_san.isoformat(), lote_san, tipo_san, prod_san.strip(),
-                dose_san.strip(), int(carencia_dias_val), data_lib_prevista.isoformat(),
-                resp_san.strip(), obs_san.strip()
-            ))
+            """, (data_san.isoformat(), lote_san, tipo_san, prod_san.strip(), dose_san.strip(), dias_car, data_lib, resp_san.strip(), ""))
             conn.commit()
             conn.close()
-            st.success(f"✅ Registro sanitário salvo para {lote_san} (liberação em {data_lib_prevista.isoformat()}).")
+            st.success(f"✅ Sanidade registrada! Liberação prevista em {data_lib}.")
             st.rerun()
 
     st.divider()
-    st.markdown("**Histórico sanitário e de carência:**")
-    if sanidade_df.empty:
-        st.info("Nenhum registro sanitário lançado ainda.")
-    else:
-        st.dataframe(sanidade_df.sort_values(by=["data_aplicacao", "id"], ascending=False), width="stretch", hide_index=True)
+    st.dataframe(sanidade_df, width="stretch", hide_index=True)
 
+# 6: CUSTOS E PREÇO
 with abas[6]:
-    st.subheader("Custos de Produção e Simulador de Preço")
-    st.caption("Separa pintinhos, alimentação consumida, custos variáveis e rateio de custos fixos — sem dupla contagem com o estoque.")
-
-    if not custos_lote_df.empty:
-        st.dataframe(custos_lote_df, width="stretch", hide_index=True)
+    st.subheader("Custos Operacionais e Formação de Preço por Lote")
+    st.dataframe(custos_lote_df, width="stretch", hide_index=True)
 
     st.divider()
-    st.markdown("**Lançar custo variável ou custo fixo:**")
+    st.markdown("**Lançar custo operacional (fixo ou variável)**")
     cu1, cu2, cu3, cu4 = st.columns(4)
-    data_custo = cu1.date_input("Data do custo", value=date.today(), key="data_custo")
-    tipo_custo_sel = cu2.selectbox("Tipo de custo", ["Variável", "Fixo"], key="tipo_custo_sel")
-    desc_custo = cu3.text_input("Descrição", placeholder="Ex.: Cama de frango / Energia / Gás", key="desc_custo")
-    val_custo_txt = cu4.text_input("Valor (R$)", placeholder="Ex.: 150.00", key="val_custo_txt")
+    data_cu = cu1.date_input("Data do lançamento", value=date.today(), key="data_cu")
+    tipo_cu = cu2.selectbox("Tipo de custo", ["Variável", "Fixo"], key="tipo_cu")
+    desc_cu = cu3.text_input("Descrição", placeholder="Ex.: Energia elétrica / Maravalha / Frete", key="desc_cu")
+    val_cu_txt = cu4.text_input("Valor (R$)", placeholder="Ex.: 150.00", key="val_cu_txt")
 
     cu5, cu6, cu7 = st.columns(3)
-    lote_custo_sel = cu5.selectbox("Destino / Lote", ["Geral (Ratear)"] + resumo_df["Lote"].tolist(), key="lote_custo_sel")
-    rateio_sel = cu6.selectbox("Base de rateio (quando geral ou fixo)", ["Por Ave Viva", "Por Lote Ativo"], key="rateio_sel")
-    obs_custo = cu7.text_input("Observação", placeholder="Opcional", key="obs_custo")
+    lote_cu = cu5.selectbox("Lote vinculado", ["Geral (Ratear)"] + lista_lotes, key="lote_cu")
+    rateio_cu = cu6.selectbox("Base de rateio", ["Por Ave Viva", "Por Lote Ativo"], key="rateio_cu")
+    obs_cu = cu7.text_input("Observação", placeholder="Opcional", key="obs_cu")
 
-    if st.button("💳 Salvar Custo", type="primary"):
+    if st.button("💰 Salvar Custo Operacional", type="primary"):
         try:
-            val_custo = parse_numero_opcional(val_custo_txt)
+            val_cu = parse_numero_opcional(val_cu_txt)
         except ValueError:
-            st.error("Valor de custo inválido.")
-            val_custo = None
+            st.error("Valor inválido.")
+            val_cu = None
 
-        if not desc_custo.strip():
+        if not desc_cu.strip():
             st.error("Informe a descrição do custo.")
-        elif val_custo is None or val_custo <= 0:
+        elif val_cu is None or val_cu <= 0:
             st.error("Informe um valor maior que zero.")
         else:
-            lote_db_val = None if lote_custo_sel == "Geral (Ratear)" else lote_custo_sel
+            lid_cu = None if lote_cu == "Geral (Ratear)" else lote_cu
             conn = get_conn()
             conn.execute("""
                 INSERT INTO custos_operacionais
                 (data_lancamento, tipo_custo, descricao, valor, lote_id, rateio_base, observacoes)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                data_custo.isoformat(), tipo_custo_sel, desc_custo.strip(),
-                float(val_custo), lote_db_val, rateio_sel, obs_custo.strip()
-            ))
+            """, (data_cu.isoformat(), tipo_cu, desc_cu.strip(), float(val_cu), lid_cu, rateio_cu, obs_cu.strip()))
             conn.commit()
             conn.close()
-            st.success(f"✅ Custo ({tipo_custo_sel}) de R$ {val_custo:.2f} salvo!")
+            st.success("✅ Custo operacional salvo!")
             st.rerun()
 
     st.divider()
-    st.markdown("**Simulador de Preço e Margem por Lote:**")
-    sim1, sim2, sim3 = st.columns(3)
-    lote_sim = sim1.selectbox("Lote para simular", resumo_df["Lote"].tolist(), key="lote_sim")
-    modo_sim = sim2.selectbox("Base de venda", ["Por Ave", "Por kg"], key="modo_sim")
-    margem_desejada_pct = sim3.number_input("Margem líquida desejada (%)", min_value=0.0, max_value=80.0, value=20.0, step=2.0, key="margem_desejada_pct")
+    st.dataframe(custos_df, width="stretch", hide_index=True)
 
-    linha_custo_sim = custos_lote_df[custos_lote_df["Lote"] == lote_sim].iloc[0]
-    linha_res_sim = resumo_df[resumo_df["Lote"] == lote_sim].iloc[0]
-    custo_base_unit = float(linha_custo_sim["Custo/Ave (R$)"]) if modo_sim == "Por Ave" else float(linha_custo_sim["Custo/kg (R$)"])
-    qtd_sim = int(linha_res_sim["Aves Disponíveis"]) if modo_sim == "Por Ave" else round(int(linha_res_sim["Aves Disponíveis"]) * float(linha_res_sim["Peso Médio (kg)"]), 2)
-
-    if custo_base_unit > 0:
-        fator_margem = max(1.0 - (margem_desejada_pct / 100.0), 0.05)
-        preco_min_sugerido = custo_base_unit / fator_margem
-        receita_prevista = preco_min_sugerido * qtd_sim
-        custo_previsto = custo_base_unit * qtd_sim
-        lucro_previsto = receita_prevista - custo_previsto
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric(f"Custo Base ({modo_sim})", f"R$ {custo_base_unit:.2f}")
-        m2.metric(f"Preço Sugerido ({modo_sim})", f"R$ {preco_min_sugerido:.2f}")
-        m3.metric("Receita Prevista", f"R$ {receita_prevista:.2f}")
-        m4.metric("Lucro Estimado", f"R$ {lucro_previsto:.2f}")
-    else:
-        st.info("Cadastre custo por pintinho/alimentação/custos (e pesagem, se for por kg) para calcular o preço sugerido deste lote.")
-
-    if not custos_df.empty:
-        st.divider()
-        st.markdown("**Lançamentos de custos operacionais:**")
-        st.dataframe(custos_df.sort_values(by=["data_lancamento", "id"], ascending=False), width="stretch", hide_index=True)
-
+# 7: VENDAS
 with abas[7]:
-    st.subheader("Vendas e Controle de Carência")
-    st.caption("Verifica disponibilidade de aves e alerta/trava lotes que ainda estejam em período de carência sanitária.")
-
+    st.subheader("Registro de Vendas")
     v1, v2, v3, v4 = st.columns(4)
-    data_venda = v1.date_input("Data da venda", value=date.today(), key="data_venda")
-    lote_venda = v2.selectbox("Lote", resumo_df["Lote"].tolist(), key="lote_venda")
-    comprador_v = v3.text_input("Comprador / Cliente", placeholder="Opcional", key="comprador_v")
-    modalidade_v = v4.selectbox("Modalidade", ["Ave Viva (Unidade)", "Peso / kg"], key="modalidade_v")
-
-    em_carencia_v, d_lib_v, status_car_v = obter_carencia_lote(lote_venda, sanidade_df)
-    lote_v_row = resumo_df[resumo_df["Lote"] == lote_venda].iloc[0]
-    aves_disp_v = int(lote_v_row["Aves Disponíveis"])
-
-    if em_carencia_v:
-        st.error(f"🚫 **ATENÇÃO — {lote_venda} está em período de carência até {d_lib_v}!** Venda bloqueada até confirmar liberação/exceção abaixo.")
-        confirmar_carencia_v = st.checkbox("Confirmo que o prazo de carência foi cumprido ou assumo responsabilidade pela venda", value=False, key="conf_car_v")
-    else:
-        st.success(f"✅ {lote_venda} sem restrição de carência ativa ({aves_disp_v} aves disponíveis).")
-        confirmar_carencia_v = True
+    data_v = v1.date_input("Data da venda", value=date.today(), key="data_v")
+    lote_v = v2.selectbox("Lote", lista_lotes, key="lote_v")
+    comp_v = v3.text_input("Comprador", placeholder="Opcional", key="comp_v")
+    mod_v = v4.selectbox("Modalidade", ["Ave viva", "Por kg", "Caixa / Lote"], key="mod_v")
 
     v5, v6, v7, v8 = st.columns(4)
-    aves_vend_qtd = v5.number_input("Aves vendidas (qtd.)", min_value=0, max_value=max(aves_disp_v, 0), value=0, step=1, key="aves_vend_qtd")
-    peso_vend_txt = v6.text_input("Peso total vendido (kg)", value="0", placeholder="Ex.: 45.0", key="peso_vend_txt")
-    preco_unit_v_txt = v7.text_input("Preço unitário (R$)", placeholder="Ex.: 35.00", key="preco_unit_v_txt")
-    status_pag_v = v8.selectbox("Status pagamento", ["Recebido", "A Receber"], key="status_pag_v")
+    aves_v_txt = v5.text_input("Aves vendidas", placeholder="Ex.: 15", key="aves_v_txt")
+    peso_v_txt = v6.text_input("Peso total (kg)", value="0", key="peso_v_txt")
+    pu_v_txt = v7.text_input("Preço unitário (R$)", placeholder="Ex.: 45.00", key="pu_v_txt")
+    status_v = v8.selectbox("Status pagamento", ["Recebido", "Pendente"], key="status_v")
 
-    obs_venda = st.text_input("Observações da venda", placeholder="Opcional", key="obs_venda")
+    em_carencia, data_lib_v, status_car_v = obter_carencia_lote(lote_v, sanidade_df)
+    if em_carencia:
+        st.warning(f"⚠️ Atenção: {lote_v} está em período de carência ({status_car_v}).")
+    confirmar_car_v = st.checkbox("Confirmo verificação de carência sanitária antes da venda", value=not em_carencia)
 
     if st.button("🤝 Registrar Venda", type="primary"):
         try:
-            peso_v = parse_numero_opcional(peso_vend_txt) or 0.0
-            preco_uv = parse_numero_opcional(preco_unit_v_txt)
+            n_aves_v = int(float(aves_v_txt.replace(",", "."))) if aves_v_txt.strip() else 0
+            p_tot_v = parse_numero_opcional(peso_v_txt) or 0.0
+            pu_v = parse_numero_opcional(pu_v_txt)
         except ValueError:
-            st.error("Peso ou preço unitário inválidos.")
-            peso_v, preco_uv = 0.0, None
+            st.error("Valores numéricos da venda inválidos.")
+            n_aves_v, p_tot_v, pu_v = 0, 0.0, None
 
-        base_qtd_preco = float(aves_vend_qtd) if modalidade_v == "Ave Viva (Unidade)" else float(peso_v)
-
-        if em_carencia_v and not confirmar_carencia_v:
-            st.error("Venda bloqueada: lote em período de carência sanitária.")
-        elif int(aves_vend_qtd) <= 0:
-            st.error("Informe a quantidade de aves vendidas (maior que zero).")
-        elif int(aves_vend_qtd) > aves_disp_v:
-            st.error(f"Quantidade maior que as aves disponíveis no lote ({aves_disp_v}).")
-        elif modalidade_v == "Peso / kg" and peso_v <= 0:
-            st.error("Informe o peso total vendido em kg maior que zero.")
-        elif preco_uv is None or preco_uv <= 0:
-            st.error("Informe um preço unitário maior que zero.")
+        if n_aves_v <= 0 or pu_v is None or pu_v <= 0:
+            st.error("Informe quantidade de aves vendidas e preço unitário maiores que zero.")
         else:
-            valor_total_v = round(base_qtd_preco * preco_uv, 2)
+            base_mult = p_tot_v if (mod_v == "Por kg" and p_tot_v > 0) else float(n_aves_v)
+            val_tot_v = round(base_mult * pu_v, 2)
             conn = get_conn()
             conn.execute("""
                 INSERT INTO vendas
                 (data_venda, lote_id, comprador, modalidade, aves_vendidas, peso_total_kg, preco_unitario, valor_total, status_pagamento, carencia_confirmada, observacoes)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                data_venda.isoformat(), lote_venda, comprador_v.strip(), modalidade_v,
-                int(aves_vend_qtd), float(peso_v), float(preco_uv), float(valor_total_v),
-                status_pag_v, 1 if confirmar_carencia_v else 0, obs_venda.strip()
+                data_v.isoformat(), lote_v, comp_v.strip(), mod_v, n_aves_v,
+                float(p_tot_v), float(pu_v), val_tot_v, status_v, 1 if confirmar_car_v else 0, ""
             ))
             conn.commit()
             conn.close()
-            st.success(f"✅ Venda registrada para {lote_venda}: {aves_vend_qtd} ave(s) — Total R$ {valor_total_v:.2f} ({status_pag_v}).")
+            st.success(f"✅ Venda registrada! Total: R$ {val_tot_v:.2f}.")
             st.rerun()
 
     st.divider()
-    st.markdown("**Histórico de vendas:**")
-    if vendas_df.empty:
-        st.info("Nenhuma venda registrada até o momento.")
-    else:
-        st.dataframe(vendas_df.sort_values(by=["data_venda", "id"], ascending=False), width="stretch", hide_index=True)
+    st.dataframe(vendas_df, width="stretch", hide_index=True)
 
+# 8: FLUXO DE CAIXA
 with abas[8]:
-    st.subheader("Fluxo de Caixa")
-    st.caption("Acompanha entradas recebidas, valores a receber e saídas financeiras registradas em compras e custos operacionais.")
+    st.subheader("Fluxo de Caixa Consolidado")
+    total_entradas = float(vendas_df["valor_total"].sum()) if not vendas_df.empty else 0.0
+    total_compras_saidas = float(compras_df["valor_total"].sum()) if not compras_df.empty else 0.0
+    total_custos_saidas = float(custos_df["valor"].sum()) if not custos_df.empty else 0.0
+    total_saidas = total_compras_saidas + total_custos_saidas
+    saldo_caixa = total_entradas - total_saidas
 
-    entradas_recebidas = float(vendas_df[vendas_df["status_pagamento"] == "Recebido"]["valor_total"].sum()) if not vendas_df.empty else 0.0
-    entradas_a_receber = float(vendas_df[vendas_df["status_pagamento"] != "Recebido"]["valor_total"].sum()) if not vendas_df.empty else 0.0
-    saidas_compras = float(compras_df["valor_total"].sum()) if not compras_df.empty else 0.0
-    saidas_custos = float(custos_df["valor"].sum()) if not custos_df.empty else 0.0
-    saidas_totais = saidas_compras + saidas_custos
-    saldo_caixa_realizado = entradas_recebidas - saidas_totais
+    f1, f2, f3 = st.columns(3)
+    f1.metric("Entradas (Vendas)", f"R$ {total_entradas:.2f}")
+    f2.metric("Saídas (Compras + Custos)", f"R$ {total_saidas:.2f}")
+    f3.metric("Saldo Líquido em Caixa", f"R$ {saldo_caixa:.2f}")
 
-    f1, f2, f3, f4 = st.columns(4)
-    f1.metric("Entradas Recebidas", f"R$ {entradas_recebidas:.2f}")
-    f2.metric("A Receber", f"R$ {entradas_a_receber:.2f}")
-    f3.metric("Saídas (Compras + Custos)", f"R$ {saidas_totais:.2f}")
-    f4.metric("Saldo Realizado", f"R$ {saldo_caixa_realizado:.2f}")
+    st.divider()
+    st.markdown("**Resumo rápido do sistema:**")
+    st.code(gerar_relatorio_ia(resumo_df, custos_lote_df, estoque_df, vendas_df, custos_df), language="text")
 
-    movs = []
-    if not vendas_df.empty:
-        for _, v in vendas_df.iterrows():
-            movs.append({
-                "Data": v["data_venda"],
-                "Tipo": "Entrada",
-                "Status": v["status_pagamento"],
-                "Origem": f"Venda ({v['lote_id']})",
-                "Descrição": str(v["comprador"] or v["modalidade"]),
-                "Valor (R$)": round(float(v["valor_total"]), 2),
-            })
-    if not compras_df.empty:
-        for _, c in compras_df.iterrows():
-            movs.append({
-                "Data": c["data_compra"],
-                "Tipo": "Saída",
-                "Status": "Pago",
-                "Origem": "Estoque / Compra",
-                "Descrição": f"{c['produto']} ({c['quantidade']} {c['unidade']})",
-                "Valor (R$)": round(-float(c["valor_total"]), 2),
-            })
-    if not custos_df.empty:
-        for _, cu in custos_df.iterrows():
-            movs.append({
-                "Data": cu["data_lancamento"],
-                "Tipo": "Saída",
-                "Status": "Pago",
-                "Origem": f"Custo {cu['tipo_custo']}",
-                "Descrição": str(cu["descricao"]),
-                "Valor (R$)": round(-float(cu["valor"]), 2),
-            })
-
-    if movs:
-        movs_df = pd.DataFrame(movs).sort_values(by="Data", ascending=False)
-        st.dataframe(movs_df, width="stretch", hide_index=True)
-    else:
-        st.info("Nenhuma movimentação financeira registrada ainda.")
-
+# 9: ASSISTENTE IA AUTÔNOMO (CHAT CONTÍNUO)
 with abas[9]:
-    st.subheader("Painel Gerencial, Alertas, Backup e Relatório IA")
+    st.subheader("🤖 Assistente IA Autônomo — Granja Vieira")
+    st.caption("Converse livremente para lançar dados, editar/excluir registros, gerar relatórios completos, receber dicas e alertas ou consultar o banco.")
 
-    alertas_lista = []
-    for _, r in resumo_df.iterrows():
-        if "Carência" in str(r["Carência"]):
-            alertas_lista.append(f"🚫 {r['Lote']}: {r['Carência']}")
-        if float(r["Mortalidade (%)"]) >= 5.0:
-            alertas_lista.append(f"⚠️ {r['Lote']}: mortalidade acumulada em {r['Mortalidade (%)']}%.")
-    if not estoque_df.empty:
-        for _, e in estoque_df.iterrows():
-            if e["Alerta"] != "✅ OK":
-                alertas_lista.append(f"📦 Estoque baixo em {e['Produto']}: {e['Saldo Atual']} {e['Unidade']} (mín. {e['Estoque Mínimo']}).")
+    if "mensagens_ia_granja" not in st.session_state:
+        st.session_state.mensagens_ia_granja = [
+            {
+                "role": "assistant",
+                "content": (
+                    "Olá! Estou pronto para ajudar na **Granja Vieira**. "
+                    "Você pode conversar comigo como em um chat para registrar compras, vendas, ração, mortalidade, sanidade, pesagens ou custos, "
+                    "editar/corrigir lançamentos, pedir um relatório completo com alertas e dicas, ou tirar dúvidas sobre o manejo."
+                ),
+            }
+        ]
 
-    if alertas_lista:
-        for al_txt in alertas_lista:
-            st.warning(al_txt)
-    else:
-        st.success("✅ Nenhum alerta crítico no momento.")
-
-    g1, g2 = st.columns(2)
-    with g1:
-        st.markdown("**Aves Disponíveis por Lote**")
-        st.bar_chart(resumo_df.set_index("Lote")["Aves Disponíveis"])
-    with g2:
-        st.markdown("**Custo Total por Lote (R$)**")
-        st.bar_chart(custos_lote_df.set_index("Lote")["Custo Total (R$)"])
-
-    st.divider()
-    st.markdown("**Exportação e Backup do Banco SQLite:**")
-    b1, b2 = st.columns(2)
-    try:
-        with open(DB_PATH, "rb") as f_db:
-            b1.download_button(
-                label="💾 Baixar Backup do Banco (granja_vieira.db)",
-                data=f_db.read(),
-                file_name=f"backup_granja_vieira_{date.today().isoformat()}.db",
-                mime="application/octet-stream",
+    col_btn1, col_btn2 = st.columns([2, 1])
+    with col_btn1:
+        if st.button("📊 Relatório Completo + Alertas e Dicas", use_container_width=True):
+            prompt_rel = (
+                "Gere um relatório completo e detalhado da Granja Vieira com alertas de atenção, "
+                "situação dos lotes, carências sanitárias, estoque, custos, vendas e dicas práticas de melhoria."
             )
-    except FileNotFoundError:
-        b1.info("Banco ainda não criado.")
+            st.session_state.mensagens_ia_granja.append({"role": "user", "content": prompt_rel})
+            with st.spinner("Analisando os dados da granja..."):
+                resp_rel = executar_assistente_granja(
+                    prompt_rel,
+                    historico=st.session_state.mensagens_ia_granja[:-1],
+                )
+            st.session_state.mensagens_ia_granja.append({"role": "assistant", "content": resp_rel})
+            st.rerun()
 
-    csv_lotes = resumo_df.to_csv(index=False).encode("utf-8-sig")
-    b2.download_button(
-        label="📄 Baixar Resumo dos Lotes (.CSV)",
-        data=csv_lotes,
-        file_name=f"resumo_lotes_granja_vieira_{date.today().isoformat()}.csv",
-        mime="text/csv",
-    )
+    with col_btn2:
+        if st.button("🧹 Nova conversa", use_container_width=True):
+            st.session_state.mensagens_ia_granja = [
+                {
+                    "role": "assistant",
+                    "content": "Conversa reiniciada! O que você quer fazer ou consultar agora?",
+                }
+            ]
+            st.rerun()
 
-    st.divider()
-    st.markdown("**Resumo pronto para copiar e colar aqui na conversa (Relatório IA):**")
-    texto_ia = gerar_relatorio_ia(resumo_df, custos_lote_df, estoque_df, vendas_df, custos_df)
-    st.text_area("Relatório consolidado", value=texto_ia, height=240)
+    for msg in st.session_state.mensagens_ia_granja:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    pergunta_usuario = st.chat_input("Digite sua mensagem para a IA da Granja Vieira...")
+    if pergunta_usuario:
+        st.session_state.mensagens_ia_granja.append({"role": "user", "content": pergunta_usuario})
+        with st.chat_message("user"):
+            st.markdown(pergunta_usuario)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Executando e analisando..."):
+                resposta_ia = executar_assistente_granja(
+                    pergunta_usuario,
+                    historico=st.session_state.mensagens_ia_granja[:-1],
+                )
+            st.markdown(resposta_ia)
+
+        st.session_state.mensagens_ia_granja.append({"role": "assistant", "content": resposta_ia})
