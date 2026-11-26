@@ -8,14 +8,25 @@ try:
 except ImportError:
     pass
 
-MODELOS_RAPIDOS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+MODELOS_RAPIDOS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-4-hydrogen",
+    "gemini-4-argon",
+    "gemini-4-carbon",
+]
 
 PROMPT_MESTRE_GRANJA = """
 Você é o Assistente Exclusivo e Oficial de Gestão Operacional, Zootécnica e Financeira da Granja Vieira.
 Sua missão é gerenciar dados, analisar desempenho, calcular custos completos de produção e orientar o produtor com máxima precisão, velocidade e zero tolerância a falhas.
 
 REGRAS DE COMPORTAMENTO E DESEMPENHO:
-1. Zero Bug e Resposta Instantânea: Seja extremamente direto, rápido, objetivo e assertivo. Elimine qualquer redundância ou enrolação. Quando o produtor pedir várias ações na mesma mensagem, responda todas em tópicos claros.
+1. Zero Bug e Resposta Instantânea: Seja extremamente direto, rápido, objetivo e assertivo. Elimine redundâncias ou enrolação. Quando o produtor pedir várias ações na mesma mensagem, responda todas em tópicos claros.
 2. Identidade Proprietária: Nunca mencione provedores externos, plataformas de terceiros, modelos de linguagem ou origens de instalação. Você é o assistente interno proprietário do sistema Gestão Granja Vieira.
 3. Arquitetura Integrada: Auxilie na análise, organização e operação de:
    - Lotes e Alojamento (lote_id, nome, tipo de ave, quantidade ajustável, data de alojamento, custo do pintinho/origem)
@@ -47,6 +58,33 @@ def _obter_chave_api() -> str:
     return ""
 
 
+@st.cache_resource(show_spinner=False)
+def _obter_cliente_genai(chave: str):
+    return genai.Client(api_key=chave)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _listar_modelos_extras(chave: str) -> list[str]:
+    try:
+        client = genai.Client(api_key=chave)
+        encontrados = []
+        for m in client.models.list():
+            nome = str(getattr(m, "name", "") or "").replace("models/", "").strip()
+            if nome and "gemini" in nome.lower() and nome not in MODELOS_RAPIDOS:
+                encontrados.append(nome)
+        return encontrados[:8]
+    except Exception:
+        return []
+
+
+def _montar_fila_modelos(chave: str) -> list[str]:
+    fila = list(MODELOS_RAPIDOS)
+    for extra in _listar_modelos_extras(chave):
+        if extra not in fila:
+            fila.append(extra)
+    return fila
+
+
 def executar_assistente_granja(
     mensagem_usuario: str,
     contexto_granja: str = "",
@@ -59,46 +97,46 @@ def executar_assistente_granja(
             "configurações de segurança do sistema."
         )
 
-    client = genai.Client(api_key=chave)
+    client = _obter_cliente_genai(chave)
 
     partes_prompt = []
     if contexto_granja and str(contexto_granja).strip():
         partes_prompt.append(f"DADOS ATUAIS DA GRANJA VIEIRA:\n{str(contexto_granja).strip()}")
 
     if historico_chat:
-        ultimas_msgs = historico_chat[-10:]
+        ultimas_msgs = historico_chat[-6:]
         linhas_hist = []
         for item in ultimas_msgs:
             if isinstance(item, dict):
                 papel = item.get("role", item.get("papel", "usuario"))
                 conteudo = item.get("content", item.get("conteudo", item.get("texto", "")))
                 if conteudo:
-                    linhas_hist.append(f"{papel}: {conteudo}")
+                    linhas_hist.append(f"{papel}: {str(conteudo)[:400]}")
         if linhas_hist:
-            partes_prompt.append("HISTÓRICO RECENTE DA CONVERSA:\n" + "\n".join(linhas_hist))
+            partes_prompt.append("HISTÓRICO RECENTE:\n" + "\n".join(linhas_hist))
 
     partes_prompt.append(f"SOLICITAÇÃO DO PRODUTOR:\n{str(mensagem_usuario).strip()}")
     prompt_completo = "\n\n---\n\n".join(partes_prompt)
 
-    ultimo_erro = ""
-    for modelo in MODELOS_RAPIDOS:
+    fila_modelos = _montar_fila_modelos(chave)
+    erros = []
+
+    for modelo in fila_modelos:
         try:
             resposta = client.models.generate_content(
                 model=modelo,
                 contents=prompt_completo,
                 config={
                     "system_instruction": PROMPT_MESTRE_GRANJA,
-                    "temperature": 0.25,
+                    "temperature": 0.35,
                 },
             )
             texto = (getattr(resposta, "text", None) or "").strip()
             if texto:
                 return texto
         except Exception as erro:
-            ultimo_erro = str(erro)
+            erros.append(f"{modelo}: {str(erro)[:120]}")
             continue
 
-    return (
-        f"Não foi possível concluir a solicitação neste instante ({ultimo_erro[:140]}). "
-        "Tente enviar novamente em alguns segundos."
-    )
+    detalhe = " | ".join(erros[-3:]) if erros else "sem resposta do serviço"
+    return f"Falha temporária na conexão com o assistente ({detalhe}). Tente novamente."
