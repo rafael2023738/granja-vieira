@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from datetime import date, datetime, timedelta
 import pandas as pd
@@ -39,6 +40,28 @@ def parse_numero_opcional(texto):
     return float(limpo)
 
 
+def registrar_backup_antes_de_alterar(cur, tabela: str, registro_id, acao: str = "EDITAR"):
+    """Salva automaticamente o estado anterior do registro antes de editar ou excluir."""
+    if registro_id is None:
+        return
+    linha = cur.execute(f"SELECT * FROM {tabela} WHERE id = ?", (registro_id,)).fetchone()
+    if linha is not None:
+        dados_dict = {k: linha[k] for k in linha.keys()}
+        cur.execute(
+            """
+            INSERT INTO auditoria_backups (data_hora, tabela_origem, registro_id, acao, dados_anteriores)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().isoformat(timespec="seconds"),
+                tabela,
+                str(registro_id),
+                acao.upper(),
+                json.dumps(dados_dict, ensure_ascii=False, default=str),
+            ),
+        )
+
+
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
@@ -48,7 +71,7 @@ def init_db():
             id TEXT PRIMARY KEY,
             nome TEXT NOT NULL,
             data_alojamento TEXT,
-            qtd_inicial INTEGER NOT NULL,
+            qtd_inicial INTEGER NOT NULL DEFAULT 0,
             tipo_ave TEXT DEFAULT '',
             origem TEXT DEFAULT '',
             custo_pintinho REAL,
@@ -161,10 +184,30 @@ def init_db():
         )
     """)
 
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS auditoria_backups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data_hora TEXT NOT NULL,
+            tabela_origem TEXT NOT NULL,
+            registro_id TEXT NOT NULL,
+            acao TEXT NOT NULL,
+            dados_anteriores TEXT NOT NULL
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_mensagens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            criado_em TEXT NOT NULL
+        )
+    """)
+
     lotes_iniciais = [
-        ("LOTE 01", "Lote 01", None, 200, "", "", None, "Ativo", ""),
-        ("LOTE 02", "Lote 02", None, 200, "", "", None, "Ativo", ""),
-        ("LOTE 03", "Lote 03", None, 200, "", "", None, "Ativo", ""),
+        ("LOTE 01", "Lote 01", None, 0, "", "", None, "Ativo", ""),
+        ("LOTE 02", "Lote 02", None, 0, "", "", None, "Ativo", ""),
+        ("LOTE 03", "Lote 03", None, 0, "", "", None, "Ativo", ""),
     ]
     cur.executemany("""
         INSERT OR IGNORE INTO lotes
@@ -174,6 +217,41 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def carregar_historico_chat_db():
+    conn = get_conn()
+    linhas = conn.execute("SELECT role, content FROM chat_mensagens ORDER BY id ASC").fetchall()
+    conn.close()
+    if linhas:
+        return [{"role": r["role"], "content": r["content"]} for r in linhas]
+    msg_inicial = (
+        "Olá! Sou o **Assistente da Granja Vieira**. "
+        "Converse comigo como em um chat para analisar lotes, calcular custo completo por ave e por kg, "
+        "tirar dúvidas de manejo, sanidade, estoque e financeiro ou gerar relatórios."
+    )
+    salvar_mensagem_chat_db("assistant", msg_inicial)
+    return [{"role": "assistant", "content": msg_inicial}]
+
+
+def salvar_mensagem_chat_db(role: str, content: str):
+    conn = get_conn()
+    conn.execute(
+        "INSERT INTO chat_mensagens (role, content, criado_em) VALUES (?, ?, ?)",
+        (role, content, datetime.now().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    conn.close()
+
+
+def limpar_historico_chat_db():
+    conn = get_conn()
+    conn.execute("DELETE FROM chat_mensagens")
+    conn.commit()
+    conn.close()
+    msg_nova = "Conversa reiniciada! O que você quer analisar ou registrar na Granja Vieira agora?"
+    salvar_mensagem_chat_db("assistant", msg_nova)
+    return [{"role": "assistant", "content": msg_nova}]
 
 
 def obter_dados_sistema():
@@ -186,6 +264,7 @@ def obter_dados_sistema():
     sanidade_df = pd.read_sql_query("SELECT * FROM sanidade ORDER BY data_aplicacao, id", conn)
     custos_df = pd.read_sql_query("SELECT * FROM custos_operacionais ORDER BY data_lancamento, id", conn)
     vendas_df = pd.read_sql_query("SELECT * FROM vendas ORDER BY data_venda, id", conn)
+    backups_df = pd.read_sql_query("SELECT * FROM auditoria_backups ORDER BY id DESC LIMIT 50", conn)
     conn.close()
 
     produtos = {}
@@ -249,7 +328,7 @@ def obter_dados_sistema():
         "Qtd. Consumida", "Saldo Atual", "Custo Médio (R$)", "Valor Estoque (R$)",
         "Estoque Mínimo", "Alerta"
     ])
-    return lotes_df, estoque_df, compras_df, alim_df, reg_df, pesagens_df, sanidade_df, custos_df, vendas_df
+    return lotes_df, estoque_df, compras_df, alim_df, reg_df, pesagens_df, sanidade_df, custos_df, vendas_df, backups_df
 
 
 def obter_carencia_lote(lote_id, sanidade_df):
@@ -322,7 +401,7 @@ def montar_resumo_e_custos(lotes_df, estoque_df, alim_df, reg_df, pesagens_df, s
 
     for _, lote in lotes_df.iterrows():
         lid = str(lote["id"])
-        qtd_ini = int(lote["qtd_inicial"])
+        qtd_ini = int(lote["qtd_inicial"] or 0)
         sit_val = "Ativo" if pd.isna(lote["situacao"]) else str(lote["situacao"])
         r_lote = reg_df[reg_df["lote_id"] == lid] if not reg_df.empty else pd.DataFrame()
         v_lote = vendas_df[vendas_df["lote_id"] == lid] if not vendas_df.empty else pd.DataFrame()
@@ -496,13 +575,24 @@ def gerar_relatorio_ia(resumo_df, custos_lote_df, estoque_df, vendas_df, custos_
     return "\n".join(linhas)
 
 
+def chamar_ia_segura(mensagem: str, contexto: str, historico: list) -> str:
+    try:
+        return executar_assistente_granja(
+            mensagem_usuario=mensagem,
+            contexto_granja=contexto,
+            historico_chat=historico,
+        )
+    except TypeError:
+        return executar_assistente_granja(mensagem, historico=historico)
+
+
 st.set_page_config(page_title="Granja Vieira", page_icon="🐔", layout="wide")
 init_db()
 
 st.title("🐔 Granja Vieira — Gestão Avícola Completa")
-st.caption("Sistema completo: Registro Rápido, Lotes, Alimentação, Estoque, Pesagens, Sanidade, Custos, Vendas, Fluxo de Caixa e Assistente IA")
+st.caption("Assistente IA, Lotes Ajustáveis, Alimentação, Estoque, Pesagens, Sanidade, Custos, Vendas, Fluxo de Caixa e Auditoria")
 
-lotes_df, estoque_df, compras_df, alim_df, reg_df, pesagens_df, sanidade_df, custos_df, vendas_df = obter_dados_sistema()
+lotes_df, estoque_df, compras_df, alim_df, reg_df, pesagens_df, sanidade_df, custos_df, vendas_df, backups_df = obter_dados_sistema()
 resumo_df, custos_lote_df = montar_resumo_e_custos(
     lotes_df, estoque_df, alim_df, reg_df, pesagens_df, sanidade_df, custos_df, vendas_df
 )
@@ -514,9 +604,10 @@ total_racao = float(resumo_df["Consumo Acum. (kg)"].sum()) if not resumo_df.empt
 total_custo_geral = float(custos_lote_df["Custo Total (R$)"].sum()) if not custos_lote_df.empty else 0.0
 lotes_ativos = int((resumo_df["Situação"] == "Ativo").sum()) if not resumo_df.empty else 0
 lista_lotes = resumo_df["Lote"].tolist() if not resumo_df.empty else ["LOTE 01", "LOTE 02", "LOTE 03"]
+contexto_atual_ia = gerar_relatorio_ia(resumo_df, custos_lote_df, estoque_df, vendas_df, custos_df)
 
 abas = st.tabs([
-    "⚡ Registro Rápido",
+    "🤖 Assistente IA",
     "🐔 Lotes",
     "🌾 Alimentação",
     "📦 Compras e Estoque",
@@ -525,12 +616,10 @@ abas = st.tabs([
     "💰 Custos e Preço",
     "🤝 Vendas",
     "💵 Fluxo de Caixa",
-    "🤖 Assistente IA",
 ])
 
-# 0: REGISTRO RÁPIDO
+# 0: ASSISTENTE IA (NO LUGAR DE REGISTRO RÁPIDO)
 with abas[0]:
-    st.subheader("Registro Diário Rápido")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Aves Disponíveis", total_aves_disp, f"de {total_aves_ini} iniciais")
     c2.metric("Lotes Ativos", lotes_ativos)
@@ -539,82 +628,73 @@ with abas[0]:
     c5.metric("Custo Total Lotes", f"R$ {total_custo_geral:.2f}")
 
     st.divider()
-    data_reg = st.date_input("Data do registro", value=date.today())
+    st.subheader("🤖 Assistente IA — Granja Vieira")
+    st.caption("Histórico salvo no banco de dados. Pergunte sobre custos por ave/kg, manejo, sanidade, estoque ou peça um relatório completo.")
 
-    st.markdown("**Lançamento por lote (deixe ração em branco se não houver medição registrada):**")
-    entradas = []
-    for _, lote in resumo_df.iterrows():
-        lid = lote["Lote"]
-        st.markdown(f"**{lid}** — Aves disponíveis: **{lote['Aves Disponíveis']}** | {lote['Carência']}")
-        col_m, col_r, col_o = st.columns([1, 1, 2])
-        mortes = col_m.number_input(
-            f"Mortes ({lid})", min_value=0, max_value=max(int(lote["Aves Disponíveis"]), 0), value=0, step=1, key=f"m_{lid}"
-        )
-        racao_txt = col_r.text_input(
-            f"Ração consumida kg ({lid})", value="", placeholder="Ex.: 12.5", key=f"r_{lid}"
-        )
-        obs = col_o.text_input(
-            f"Observações / sanidade ({lid})", value="", placeholder="Opcional", key=f"o_{lid}"
-        )
-        entradas.append((lid, mortes, racao_txt, obs))
+    if "mensagens_ia_granja" not in st.session_state:
+        st.session_state.mensagens_ia_granja = carregar_historico_chat_db()
 
-    if st.button("💾 Salvar Registro do Dia", type="primary"):
-        conn = get_conn()
-        cur = conn.cursor()
-        salvos = 0
-        erros = []
-
-        for lid, mortes, racao_txt, obs in entradas:
-            racao_val = None
-            if racao_txt.strip():
-                try:
-                    racao_val = parse_numero_opcional(racao_txt)
-                    if racao_val is not None and racao_val < 0:
-                        erros.append(f"{lid}: ração não pode ser negativa.")
-                        continue
-                except ValueError:
-                    erros.append(f"{lid}: valor de ração '{racao_txt}' inválido.")
-                    continue
-
-            duplicado = cur.execute(
-                "SELECT COUNT(*) FROM registros_diarios WHERE data_registro = ? AND lote_id = ?",
-                (data_reg.isoformat(), lid),
-            ).fetchone()[0]
-            if duplicado > 0:
-                st.warning(f"⚠️ Já existe registro para **{lid}** na data **{data_reg.isoformat()}**. Salvando mesmo assim para conferência.")
-
-            if mortes > 0 or racao_val is not None or obs.strip():
-                cur.execute("""
-                    INSERT INTO registros_diarios (data_registro, lote_id, aves_mortas, racao_kg, observacoes)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (data_reg.isoformat(), lid, int(mortes), racao_val, obs.strip()))
-                salvos += 1
-
-        conn.commit()
-        conn.close()
-
-        for err in erros:
-            st.error(err)
-        if salvos > 0:
-            st.success(f"✅ {salvos} registro(s) salvo(s) com sucesso!")
+    col_btn1, col_btn2 = st.columns([2, 1])
+    with col_btn1:
+        if st.button("📊 Relatório Completo + Alertas e Dicas", use_container_width=True):
+            prompt_rel = (
+                "Gere um relatório completo e direto da Granja Vieira com alertas de atenção, "
+                "situação dos lotes, carências sanitárias, estoque, custo total, custo por ave e por kg, e dicas práticas."
+            )
+            st.session_state.mensagens_ia_granja.append({"role": "user", "content": prompt_rel})
+            salvar_mensagem_chat_db("user", prompt_rel)
+            with st.spinner("Analisando os dados da granja..."):
+                resp_rel = chamar_ia_segura(
+                    prompt_rel,
+                    contexto_atual_ia,
+                    st.session_state.mensagens_ia_granja[:-1],
+                )
+            st.session_state.mensagens_ia_granja.append({"role": "assistant", "content": resp_rel})
+            salvar_mensagem_chat_db("assistant", resp_rel)
             st.rerun()
-        elif not erros:
-            st.info("Nenhuma alteração preenchida para salvar.")
 
-# 1: LOTES
+    with col_btn2:
+        if st.button("🧹 Nova conversa", use_container_width=True):
+            st.session_state.mensagens_ia_granja = limpar_historico_chat_db()
+            st.rerun()
+
+    for msg in st.session_state.mensagens_ia_granja:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    pergunta_usuario = st.chat_input("Digite sua mensagem para o Assistente da Granja Vieira...")
+    if pergunta_usuario:
+        st.session_state.mensagens_ia_granja.append({"role": "user", "content": pergunta_usuario})
+        salvar_mensagem_chat_db("user", pergunta_usuario)
+        with st.chat_message("user"):
+            st.markdown(pergunta_usuario)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Respondendo..."):
+                resposta_ia = chamar_ia_segura(
+                    pergunta_usuario,
+                    contexto_atual_ia,
+                    st.session_state.mensagens_ia_granja[:-1],
+                )
+            st.markdown(resposta_ia)
+
+        st.session_state.mensagens_ia_granja.append({"role": "assistant", "content": resposta_ia})
+        salvar_mensagem_chat_db("assistant", resposta_ia)
+
+# 1: LOTES (QUANTIDADE DE AVES AJUSTÁVEL + BACKUP AUTOMÁTICO)
 with abas[1]:
-    st.subheader("Controle de Lotes")
+    st.subheader("Controle de Lotes (Quantidade de Aves Ajustável)")
     st.dataframe(resumo_df, width="stretch", hide_index=True)
 
     st.divider()
-    st.markdown("**Editar dados do lote (data de alojamento, tipo de ave, origem, custo ou situação):**")
+    st.markdown("**Editar lote existente (quantidade inicial de aves ajustável, data, tipo, origem, custo ou situação):**")
     lote_escolhido = st.selectbox("Selecione o lote", lista_lotes)
 
     conn = get_conn()
     lote_row = conn.execute("SELECT * FROM lotes WHERE id = ?", (lote_escolhido,)).fetchone()
     conn.close()
 
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_qtd = st.columns(4)
     d_aloj_salva = parse_data_segura(lote_row["data_alojamento"])
     tem_data = d_aloj_salva is not None
     marcar_data = col_a.checkbox("Informar data de alojamento", value=tem_data)
@@ -628,6 +708,8 @@ with abas[1]:
 
     novo_tipo = col_b.text_input("Tipo de ave / raça", value=tipo_atual, placeholder="Ex.: Mestiço Índio Gigante")
     nova_sit = col_c.selectbox("Situação", opcoes_sit, index=idx_sit)
+    qtd_atual_lote = int(lote_row["qtd_inicial"] or 0)
+    nova_qtd_inicial = col_qtd.number_input("Quantidade de aves do lote", min_value=0, value=qtd_atual_lote, step=1)
 
     col_d, col_e, col_f = st.columns(3)
     origem_atual = "" if lote_row["origem"] is None else str(lote_row["origem"])
@@ -641,7 +723,7 @@ with abas[1]:
     )
     nova_obs = col_f.text_input("Observações do lote", value=obs_atual)
 
-    if st.button("Atualizar Lote"):
+    if st.button("Atualizar Lote", type="primary"):
         custo_val = None
         erro_custo = False
         if custo_txt.strip():
@@ -654,15 +736,57 @@ with abas[1]:
         if not erro_custo:
             data_salvar = nova_data_aloj.isoformat() if marcar_data else None
             conn = get_conn()
-            conn.execute("""
+            cur = conn.cursor()
+            registrar_backup_antes_de_alterar(cur, "lotes", lote_escolhido, acao="EDITAR")
+            cur.execute("""
                 UPDATE lotes
-                SET data_alojamento = ?, tipo_ave = ?, situacao = ?, origem = ?, custo_pintinho = ?, observacoes = ?
+                SET qtd_inicial = ?, data_alojamento = ?, tipo_ave = ?, situacao = ?, origem = ?, custo_pintinho = ?, observacoes = ?
                 WHERE id = ?
-            """, (data_salvar, novo_tipo.strip(), nova_sit, nova_origem.strip(), custo_val, nova_obs.strip(), lote_escolhido))
+            """, (int(nova_qtd_inicial), data_salvar, novo_tipo.strip(), nova_sit, nova_origem.strip(), custo_val, nova_obs.strip(), lote_escolhido))
             conn.commit()
             conn.close()
-            st.success(f"✅ {lote_escolhido} atualizado!")
+            st.success(f"✅ {lote_escolhido} atualizado com {int(nova_qtd_inicial)} aves (backup salvo automaticamente)!")
             st.rerun()
+
+    st.divider()
+    st.markdown("**Criar novo lote com capacidade ajustável:**")
+    n1, n2, n3, n4 = st.columns(4)
+    novo_id_lote = n1.text_input("Código do lote", placeholder="Ex.: LOTE 04", key="novo_id_lote")
+    novo_nome_lote = n2.text_input("Nome do lote", placeholder="Ex.: Lote 04", key="novo_nome_lote")
+    nova_qtd_lote = n3.number_input("Quantidade inicial de aves", min_value=1, value=100, step=1, key="nova_qtd_lote")
+    novo_custo_pint_txt = n4.text_input("Custo por pintinho (R$)", value="", placeholder="Opcional", key="novo_custo_pint_txt")
+
+    if st.button("➕ Criar Novo Lote"):
+        cod_limpo = novo_id_lote.strip().upper()
+        if not cod_limpo:
+            st.error("Informe o código do lote (ex.: LOTE 04).")
+        else:
+            try:
+                c_pint = parse_numero_opcional(novo_custo_pint_txt)
+            except ValueError:
+                st.error("Custo por pintinho inválido.")
+                c_pint = None
+
+            conn = get_conn()
+            cur = conn.cursor()
+            existe = cur.execute("SELECT COUNT(*) FROM lotes WHERE id = ?", (cod_limpo,)).fetchone()[0]
+            if existe > 0:
+                st.warning(f"O lote {cod_limpo} já existe.")
+            else:
+                cur.execute("""
+                    INSERT INTO lotes
+                    (id, nome, data_alojamento, qtd_inicial, tipo_ave, origem, custo_pintinho, situacao, observacoes)
+                    VALUES (?, ?, ?, ?, '', '', ?, 'Ativo', '')
+                """, (cod_limpo, (novo_nome_lote.strip() or cod_limpo), date.today().isoformat(), int(nova_qtd_lote), c_pint))
+                conn.commit()
+                st.success(f"✅ {cod_limpo} criado com {int(nova_qtd_lote)} aves!")
+                conn.close()
+                st.rerun()
+            conn.close()
+
+    st.divider()
+    st.markdown("**Histórico de backups automáticos (pré-edição/exclusão):**")
+    st.dataframe(backups_df, width="stretch", hide_index=True)
 
 # 2: ALIMENTAÇÃO
 with abas[2]:
@@ -996,66 +1120,3 @@ with abas[8]:
     st.divider()
     st.markdown("**Resumo rápido do sistema:**")
     st.code(gerar_relatorio_ia(resumo_df, custos_lote_df, estoque_df, vendas_df, custos_df), language="text")
-
-# 9: ASSISTENTE IA AUTÔNOMO (CHAT CONTÍNUO)
-with abas[9]:
-    st.subheader("🤖 Assistente IA Autônomo — Granja Vieira")
-    st.caption("Converse livremente para lançar dados, editar/excluir registros, gerar relatórios completos, receber dicas e alertas ou consultar o banco.")
-
-    if "mensagens_ia_granja" not in st.session_state:
-        st.session_state.mensagens_ia_granja = [
-            {
-                "role": "assistant",
-                "content": (
-                    "Olá! Estou pronto para ajudar na **Granja Vieira**. "
-                    "Você pode conversar comigo como em um chat para registrar compras, vendas, ração, mortalidade, sanidade, pesagens ou custos, "
-                    "editar/corrigir lançamentos, pedir um relatório completo com alertas e dicas, ou tirar dúvidas sobre o manejo."
-                ),
-            }
-        ]
-
-    col_btn1, col_btn2 = st.columns([2, 1])
-    with col_btn1:
-        if st.button("📊 Relatório Completo + Alertas e Dicas", use_container_width=True):
-            prompt_rel = (
-                "Gere um relatório completo e detalhado da Granja Vieira com alertas de atenção, "
-                "situação dos lotes, carências sanitárias, estoque, custos, vendas e dicas práticas de melhoria."
-            )
-            st.session_state.mensagens_ia_granja.append({"role": "user", "content": prompt_rel})
-            with st.spinner("Analisando os dados da granja..."):
-                resp_rel = executar_assistente_granja(
-                    prompt_rel,
-                    historico=st.session_state.mensagens_ia_granja[:-1],
-                )
-            st.session_state.mensagens_ia_granja.append({"role": "assistant", "content": resp_rel})
-            st.rerun()
-
-    with col_btn2:
-        if st.button("🧹 Nova conversa", use_container_width=True):
-            st.session_state.mensagens_ia_granja = [
-                {
-                    "role": "assistant",
-                    "content": "Conversa reiniciada! O que você quer fazer ou consultar agora?",
-                }
-            ]
-            st.rerun()
-
-    for msg in st.session_state.mensagens_ia_granja:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-    pergunta_usuario = st.chat_input("Digite sua mensagem para a IA da Granja Vieira...")
-    if pergunta_usuario:
-        st.session_state.mensagens_ia_granja.append({"role": "user", "content": pergunta_usuario})
-        with st.chat_message("user"):
-            st.markdown(pergunta_usuario)
-
-        with st.chat_message("assistant"):
-            with st.spinner("Executando e analisando..."):
-                resposta_ia = executar_assistente_granja(
-                    pergunta_usuario,
-                    historico=st.session_state.mensagens_ia_granja[:-1],
-                )
-            st.markdown(resposta_ia)
-
-        st.session_state.mensagens_ia_granja.append({"role": "assistant", "content": resposta_ia})
